@@ -3,121 +3,59 @@ name: Build and Deploy
 on:
   push:
     branches: [ main ]
+  workflow_dispatch: # Allows manual triggering from GitHub Actions UI
+
+env:
+  REGISTRY: ghcr.io
+  BACKEND_IMAGE: ghcr.io/allerk/borsibaar-backend
+  FRONTEND_IMAGE: ghcr.io/allerk/borsibaar-frontend
+  #      DEPLOY_PATH: /opt/borsibaar
+  DOCKER_COMPOSE_FILE: docker-compose.prod.yaml
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
-    env:
-      SSH_USER: ${{ secrets.SSH_USER }}
-      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-      SERVER_IP: ${{ secrets.SERVER_IP }}
-      DEPLOY_PATH: ~/studentbar-pos-deploy
-      ENV_PRODUCTION_FILE: ${{ secrets.ENV_PRODUCTION_FILE }}
-      DOCKER_COMPOSE_FILE: docker-compose.prod.yaml
+    permissions:
+      contents: read
+      packages: write # Required to push images to ghcr.io
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+      # BuildKit enables efficient Docker builds with layer caching
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
-          distribution: temurin
-          java-version: '21'
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build backend
-        working-directory: backend
-        run: ./mvnw clean package -DskipTests
-
-      - name: Set up Node 20
-        uses: actions/setup-node@v4
+      # Backend: multi-stage build (Maven + JRE) with GHA layer caching
+      - name: Build and push backend image
+        uses: docker/build-push-action@v6
         with:
-          node-version: '20'
+          context: backend
+          file: backend/Dockerfile
+          push: true
+          tags: ${{ env.BACKEND_IMAGE }}:latest,${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
 
-      - name: Install frontend dependencies
-        working-directory: frontend
-        run: npm ci
-
-      - name: Build frontend
-        working-directory: frontend
-        run: npm run build
-
-      - name: Set up SSH key
-        run: |
-          mkdir -p ~/.ssh
-          echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan "$SERVER_IP" >> ~/.ssh/known_hosts
-
-      - name: Create .env.production from secret
-        run: |
-          printf '%s\n' "$ENV_PRODUCTION_FILE" > .env.production
-
-      - name: Create deployment package
-        run: |
-          tar czf deployment.tar.gz \
-            backend/target/*.jar \
-            frontend/ \
-            nginx/ \
-            "$DOCKER_COMPOSE_FILE" \
-            backend/Dockerfile \
-            frontend/Dockerfile \
-            .env.production
-
-      - name: Install sshpass and openssh-client
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y sshpass openssh-client
-
-      - name: Copy deployment package to server
-        run: |
-          scp -i ~/.ssh/id_rsa \
-            -o StrictHostKeyChecking=yes \
-            deployment.tar.gz \
-            "$SSH_USER@$SERVER_IP:/tmp/"
-
-      - name: Deploy on server
-        run: |
-          ssh -i ~/.ssh/id_rsa \
-            -o StrictHostKeyChecking=yes \
-            "$SSH_USER@$SERVER_IP" << EOF
-          set -e
-
-          mkdir -p $DEPLOY_PATH
-          cd $DEPLOY_PATH
-
-          # Extract deployment package
-          tar xzf /tmp/deployment.tar.gz
-          rm /tmp/deployment.tar.gz
-
-          # Check if docker-compose file exists
-          if [ ! -f "$DOCKER_COMPOSE_FILE" ]; then
-            echo "ERROR: $DOCKER_COMPOSE_FILE not found!"
-            exit 1
-          fi
-
-          # Copy environment file if exists
-          if [ -f .env.production ]; then
-            cp .env.production .env
-          fi
-
-          # Clean/repair builder cache and avoid BuildKit flakiness
-          # sudo systemctl restart docker
-          # docker buildx prune -af || true
-          # docker builder prune -af || true
-          # docker image prune -af || true
-
-          # Stop existing containers
-          docker compose -f "$DOCKER_COMPOSE_FILE" down
-
-          # Rebuild and start containers
-          docker compose -f "$DOCKER_COMPOSE_FILE" build --no-cache
-          docker compose -f "$DOCKER_COMPOSE_FILE" up -d
-
-          # Clean up old images
-          # docker image prune -f
-
-          echo "Deployment complete!"
-          docker compose -f "$DOCKER_COMPOSE_FILE" ps
-          EOF
+      # Frontend: multi-stage build (Node + standalone Next.js) with GHA layer caching
+      # NEXT_PUBLIC_BACKEND_URL is needed at build time for client-side OAuth redirects
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: frontend/Dockerfile
+          push: true
+          tags: ${{ env.FRONTEND_IMAGE }}:latest,${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+          build-args: |
+            NEXT_PUBLIC_BACKEND_URL=${{ vars.NEXT_PUBLIC_BACKEND_URL }}
